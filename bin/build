@@ -1,0 +1,208 @@
+#!/bin/sh -
+
+ELM_VERSION=0.19.1
+ELM_FORMAT_VERSION=0.8.3
+
+GHC_VERSION=8.8.1
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-elm)
+            NO_ELM="yes"
+            ;;
+        --no-elm-format)
+            NO_ELM_FORMAT="yes"
+            ;;
+        --no-patch)
+            NO_PATCH="yes"
+            ;;
+        --no-update)
+            NO_UPDATE="yes"
+            ;;
+    esac
+    shift
+done
+
+abort() {
+    echo "!!! ABORT ${*}"
+    exit 1
+}
+
+git_clone() {
+    if [ ! -d build/$1 ]; then
+        echo "==> GIT $1"
+        git clone https://github.com/$2 build/$1 \
+            || abort "unable to clone github.com/$2"
+    fi
+}
+
+git_tag() {
+    TAG=$( cd build/$1 ; git describe --tags )
+    if [ "$2" != "${TAG}" ]; then
+        echo "==> TAG $1 $2"
+        ( cd build/$1 ; git checkout tags/$2 ) > log/$1-tag 2>&1 \
+            || abort "unable to checkout tags/$2 (see log/$1-tag)"
+    fi
+}
+
+project_init() {
+    cat <<EOF > build/elm/cabal.project
+packages:
+    ../elm/
+EOF
+}
+
+project_patch() {
+    echo "    ../$1/" >> build/elm/cabal.project
+}
+
+clean() {
+    echo "==> CLEAN"
+    rm -r -f build/dist-newstyle \
+        || abort "unable to delete build/dist-newstyle/"
+}
+
+update() {
+    echo "==> UPDATE hackage"
+    cabal new-update > log/cabal-update 2>&1 \
+        || abort "unable to update hackages (see log/cabal-update)"
+}
+
+patch_clone() {
+    git_clone $1 $2
+    git_tag $1 $3
+    project_patch $1
+}
+
+patch_file() {
+    PATCH="patch-$1-$(echo "$2" | sed -e "s/\//_/g")"
+    if [ ! -f "files/${PATCH}" ]; then
+        abort "files/${PATCH} missing"
+    fi
+    if [ ! -e "build/$1/$2.orig" ]; then
+        echo "==> PATCH ${PATCH}"
+        ( cd build/$1 ; patch -b -u -s $2 ../../files/${PATCH} ) \
+            || abort "unable to patch $1/$2"
+    fi
+}
+
+patch_auto() {
+    if [ ! -e "build/$1/$2" ]; then
+        echo "==> AUTO $1"
+        ( cd build/$1 ; autoreconf -i ) 2>&1 | tee log/$1-autoreconf \
+            || abort "unable to autoreconf $1 (see log/$1-autoreconf)"
+
+        if [ ! -e "build/$1/$2" ]; then
+            abort "autoreconf did not make build/$1/$2"
+        fi
+    fi
+}
+
+if [ ! -d "/usr/pkg/lib/ghc-${GHC_VERSION}" ]; then
+    abort "/usr/pkg/lib/ghc-${GHC_VERSION} not found (check \$GHC_VERSION)"
+fi
+
+clean
+if [ -z "${NO_UPDATE}" ]; then
+    update
+fi
+
+if [ -z "${NO_ELM}" ]; then
+    git_clone elm elm/compiler
+    git_tag elm ${ELM_VERSION}
+
+    project_init
+fi
+
+if [ -z "${NO_ELM}${NO_PATCH}" ]; then
+    patch_clone clock corsis/clock 0.8
+    patch_file clock System/Clock.hsc
+
+    patch_clone hourglass vincenthz/hs-hourglass hourglass-v0.2.12
+    patch_file hourglass Data/Hourglass/Internal/Unix.hs
+
+    patch_clone memory vincenthz/hs-memory memory-v0.15.0
+    patch_file memory Data/Memory/MemMap/Posix.hsc
+
+    patch_clone network haskell/network v2.6.3.6
+    patch_file network Network/Socket.hsc
+    patch_auto network configure
+
+    patch_clone snap-core snapframework/snap-core 1.0.4.1
+    patch_file snap-core cbits/timefuncs.c
+fi
+
+if [ -z "${NO_ELM}" ]; then
+    echo "==> BUILD elm"
+    ( cd build/elm ; cabal new-build elm ) 2>&1 | tee log/elm-build \
+        || abort "unable to build elm (see log/elm-build)"
+
+    sed -n -f files/compatibility.sed log/elm-build > log/elm-compatibility
+
+    if [ -s log/elm-compatibility ]; then
+        echo ""
+        echo "!!! ABORT build failed with reference to compatibility warnings"
+        echo ""
+        echo "The warnings occured in:"
+        sed -n -f files/compatibility-in.sed log/elm-build | sort -u
+        echo ""
+        echo "(see log/elm-compatibility for further details)"
+        exit 1
+    fi
+
+    BUILT=build/elm/dist-newstyle/build/x86_64-netbsd/ghc-${GHC_VERSION}/elm-${ELM_VERSION}/x/elm/build/elm/elm
+
+    if [ ! -f "${BUILT}" ]; then
+        abort "expected ${BUILT} not found"
+    fi
+
+    cp "${BUILT}" output/elm
+    strip -s output/elm
+fi
+
+if [ -z "${NO_ELM_FKRMAT}" ]; then
+    git_clone elm-format avh4/elm-format
+    git_tag elm-format ${ELM_FORMAT_VERSION}
+
+    patch_file elm-format elm-format.cabal
+    patch_file elm-format markdown/Cheapskate/ParserCombinators.hs
+
+    if [ ! -d build/elm-format/generated ]; then
+        mkdir build/elm-format/generated
+    fi
+
+    if [ ! -f build/elm-format/generated/Build_elm_format.hs ]; then
+        cat <<EOF > build/elm-format/generated/Build_elm_format.hs
+module Build_elm_format where
+
+gitDescribe :: String
+gitDescribe = "${ELM_FORMAT_VERSION}"
+EOF
+    fi
+
+    echo "==> BUILD elm-format"
+    ( cd build/elm-format ; cabal new-build exe:elm-format ) 2>&1 \
+        | tee log/elm-format-build \
+        || abort "unable to build elm-format (see log/elm-format-build)"
+
+    BUILT=build/elm-format/dist-newstyle/build/x86_64-netbsd/ghc-${GHC_VERSION}/elm-format-${ELM_FORMAT_VERSION}/x/elm-format/build/elm-format/elm-format
+
+    if [ ! -f "${BUILT}" ]; then
+        abort "expected ${BUILT} not found"
+    fi
+
+    cp "${BUILT}" output/elm-format
+    strip -s output/elm-format
+fi
+
+echo "==> DONE"
+echo ""
+echo "Output files are:"
+if [ -z "${NO_ELM}" ]; then
+    echo "  output/elm"
+fi
+if [ -z "${NO_ELM_FKRMAT}" ]; then
+    echo "  output/elm-format"
+fi
+echo ""
+

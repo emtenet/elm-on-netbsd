@@ -1,0 +1,28 @@
+#!/bin/sh -
+if [ -z "$2" ]; then
+    echo "bin/diff <hackage> <File/To.diff>"
+    exit 1
+fi
+
+if [ ! -d "build/$1" ]; then
+    echo "!!! ABORT build/$1 is not a directory"
+    exit 1
+fi
+
+if [ ! -f "build/$1/$2" ]; then
+    echo "!!! ABORT build/$1/$2 is not a regular file"
+    exit 1
+fi
+
+if [ ! -f "build/$1/$2.orig" ]; then
+    echo "!!! ABORT build/$1/$2.orig is not a regular file"
+    exit 1
+fi
+
+PATCH="patch-$1-$(echo "$2" | sed -e "s/\//_/g")"
+
+echo "==> PATCH files/${PATCH}"
+
+( cd build/$1 ; diff -u $2.orig $2 ) > files/${PATCH}
+
+
